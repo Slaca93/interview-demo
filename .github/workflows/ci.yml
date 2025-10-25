@@ -17,6 +17,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Compute lowercase repo
+        id: vars
+        run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -26,14 +30,14 @@ jobs:
 
       - name: Build & push frontend
         run: |
-          IMAGE=ghcr.io/${{ github.repository }}-frontend
+          IMAGE=ghcr.io/${{ steps.vars.outputs.repo_lower }}-frontend
           docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest ./frontend
           docker push $IMAGE:${{ github.sha }}
           docker push $IMAGE:latest
 
       - name: Build & push backend
         run: |
-          IMAGE=ghcr.io/${{ github.repository }}-backend
+          IMAGE=ghcr.io/${{ steps.vars.outputs.repo_lower }}-backend
           docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest ./backend
           docker push $IMAGE:${{ github.sha }}
           docker push $IMAGE:latest
