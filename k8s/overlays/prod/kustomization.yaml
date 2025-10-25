@@ -1,0 +1,8 @@
+namespace: interview-demo
+resources:
+  - ../../base
+images:
+  - name: ghcr.io/slaca93/interview-demo-backend
+    newTag: latest
+  - name: ghcr.io/slaca93/interview-demo-frontend
+    newTag: latest
