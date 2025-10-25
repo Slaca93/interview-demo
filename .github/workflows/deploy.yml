@@ -1,0 +1,23 @@
+name: Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: [ self-hosted, k8s-deployer ]
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kubectl version
+        run: kubectl version --client=true
+      - name: Kustomize apply (prod)
+        run: |
+          kustomize build k8s/overlays/prod | kubectl apply -f -
+      - name: Wait for rollout
+        run: |
+          kubectl -n interview-demo rollout status deploy/frontend --timeout=120s
+          kubectl -n interview-demo rollout status deploy/backend --timeout=120s
+      - name: Show services
+        run: kubectl -n interview-demo get svc,pod -o wide
