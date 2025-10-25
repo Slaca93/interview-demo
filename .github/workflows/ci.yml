@@ -13,6 +13,7 @@ permissions:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,16 +29,61 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push frontend
+      # ---------- FRONTEND ----------
+      - name: FE | Install & build (Node 20)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: FE | Build app
+        working-directory: frontend
         run: |
-          IMAGE=ghcr.io/${{ steps.vars.outputs.repo_lower }}-frontend
-          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest ./frontend
-          docker push $IMAGE:${{ github.sha }}
-          docker push $IMAGE:latest
+          echo "::group::Frontend: npm ci & build"
+          npm ci
+          npm run build --if-present
+          echo "::endgroup::"
 
-      - name: Build & push backend
+      - name: FE | Docker build
         run: |
-          IMAGE=ghcr.io/${{ steps.vars.outputs.repo_lower }}-backend
-          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest ./backend
-          docker push $IMAGE:${{ github.sha }}
-          docker push $IMAGE:latest
+          echo "::group::Frontend: docker build"
+          IMAGE="ghcr.io/${{ steps.vars.outputs.repo_lower }}-frontend"
+          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" ./frontend
+          echo "IMAGE_FE=$IMAGE" >> $GITHUB_ENV
+          echo "::endgroup::"
+
+      - name: FE | Docker push
+        run: |
+          echo "::group::Frontend: docker push"
+          docker push "$IMAGE_FE:${{ github.sha }}"
+          docker push "$IMAGE_FE:latest"
+          echo "::endgroup::"
+
+      # ---------- BACKEND ----------
+      - name: BE | Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: BE | Maven warmup (skip tests)
+        working-directory: backend
+        run: |
+          echo "::group::Backend: mvn package (skip tests)"
+          mvn -B -e -Dmaven.test.skip=true package
+          echo "::endgroup::"
+
+      - name: BE | Docker build
+        run: |
+          echo "::group::Backend: docker build"
+          IMAGE="ghcr.io/${{ steps.vars.outputs.repo_lower }}-backend"
+          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" ./backend
+          echo "IMAGE_BE=$IMAGE" >> $GITHUB_ENV
+          echo "::endgroup::"
+
+      - name: BE | Docker push
+        run: |
+          echo "::group::Backend: docker push"
+          docker push "$IMAGE_BE:${{ github.sha }}"
+          docker push "$IMAGE_BE:latest"
+          echo "::endgroup::"
