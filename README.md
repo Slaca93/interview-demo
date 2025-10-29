@@ -46,8 +46,8 @@ Képek:
 
 ---
 
-## Előkövetelmények
-- Kubernetes klaszter + `kubectl`
+## Requierments:
+- Kubernetes cluster + `kubectl`
 - **kustomize**
 - **Ingress NGINX** telepítve **NodePort** módban (HTTP: `31080`, HTTPS: `31443`)
 - GitHub Actions **Workflow permissions**: _Read and write permissions_
