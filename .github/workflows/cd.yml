@@ -85,13 +85,6 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Deploying commit: $SHA"
 
-      - name: Login to GHCR (for docker manifest inspect)
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
       - name: Preflight (kubectl/kustomize, namespace)
         shell: bash
         run: |
@@ -121,22 +114,83 @@ jobs:
             echo "(info) 'kubectl diff' not available on this runner."
           fi
 
-      - name: "Preflight: images exist in GHCR"
-        shell: bash
-        env:
-          REPO: ghcr.io/${{ steps.vars.outputs.repo_lower }}
-          SHA:  ${{ steps.rev.outputs.sha }}
-        run: |
-          set -euo pipefail
-          for comp in backend frontend; do
-            IMAGE="$REPO-$comp:$SHA"
-            if ! docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
-              echo "❌ Missing image: $IMAGE"
-              echo "Tip: ellenőrizd, hogy a CI feltolta-e a képet erre a SHA-ra."
-              exit 1
-            fi
-            echo "✅ Found image: $IMAGE"
-          done
+          - name: Preflight: images exist in GHCR (GitHub API, no Docker)
+            shell: bash
+            env:
+              OWNER: ${{ github.repository_owner }}
+              REPO_NAME: ${{ github.event.repository.name }}
+              SHA:  ${{ steps.rev.outputs.sha }}
+              GITHUB_TOKEN: ${{ github.token }}
+            run: |
+              set -euo pipefail
+          
+              need_jq() {
+                if ! command -v jq >/dev/null 2>&1; then
+                  if command -v apt-get >/dev/null 2>&1; then
+                    sudo apt-get update -y && sudo apt-get install -y jq
+                  else
+                    echo "jq not found and cannot be installed automatically."
+                    exit 1
+                  fi
+                fi
+              }
+          
+              need_jq
+          
+              check_pkg_tag() {
+                local owner="$1" pkg="$2" tag="$3"
+          
+                # Próbáljuk user endpointtal...
+                url_user="https://api.github.com/users/${owner}/packages/container/${pkg}/versions?per_page=100"
+                # ...ha 404, próbáljuk org endpointtal
+                url_org="https://api.github.com/orgs/${owner}/packages/container/${pkg}/versions?per_page=100"
+          
+                # user endpoint
+                code_user=$(curl -fsS -o /tmp/pkgs.json -w "%{http_code}" \
+                  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${url_user}" || true)
+          
+                if [ "${code_user}" = "200" ]; then
+                  if jq -e --arg TAG "${tag}" '
+                      .[] | .metadata.container.tags? // [] | index($TAG)
+                    ' /tmp/pkgs.json >/dev/null; then
+                    echo "✅ Found tag '${tag}' for package '${pkg}' (user endpoint)."
+                    return 0
+                  fi
+                elif [ "${code_user}" != "404" ]; then
+                  echo "GitHub API error ${code_user} on: ${url_user}"
+                  return 2
+                fi
+          
+                # org endpoint
+                code_org=$(curl -fsS -o /tmp/pkgs.json -w "%{http_code}" \
+                  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${url_org}" || true)
+          
+                if [ "${code_org}" = "200" ]; then
+                  if jq -e --arg TAG "${tag}" '
+                      .[] | .metadata.container.tags? // [] | index($TAG)
+                    ' /tmp/pkgs.json >/dev/null; then
+                    echo "✅ Found tag '${tag}' for package '${pkg}' (org endpoint)."
+                    return 0
+                  fi
+                elif [ "${code_org}" != "404" ]; then
+                  echo "GitHub API error ${code_org} on: ${url_org}"
+                  return 2
+                fi
+          
+                echo "❌ Tag '${tag}' not found for package '${pkg}'."
+                return 1
+              }
+          
+              # GHCR package nevek: <repo>-backend és <repo>-frontend
+              PKG_BE="${REPO_NAME}-backend"
+              PKG_FE="${REPO_NAME}-frontend"
+          
+              check_pkg_tag "${OWNER}" "${PKG_BE}" "${SHA}" || exit 1
+              check_pkg_tag "${OWNER}" "${PKG_FE}" "${SHA}" || exit 1
 
       - name: Apply overlays
         shell: bash

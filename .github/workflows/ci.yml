@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ "main", "develop", "feature/**" ]
+    branches: [ "main", "develop", "feature/**" ] #TEST
     paths:
       - "frontend/**"
       - "backend/**"
