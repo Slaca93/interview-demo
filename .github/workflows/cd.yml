@@ -1,0 +1,137 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]          # a CI workflow neve
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch/tag/SHA) to deploy"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # csak sikeres CI után fusson (workflow_run ágon)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: [ self-hosted, k8s-deployer ]
+    environment:
+      name: prod
+      url: http://demo.local:31080
+    env:
+      NS: interview-demo
+
+    steps:
+      - name: Checkout manifests
+        uses: actions/checkout@v4
+        with:
+          # workflow_run esetén a main HEAD-re váltunk
+          ref: ${{ github.event_name == 'workflow_run' && 'main' || (inputs.ref || 'main') }}
+          fetch-depth: 0
+
+      - name: Compute lowercase repo
+        id: vars
+        run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve deploy SHA
+        id: rev
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            # dispatch: a megadott ref lehet ág/tag/SHA
+            git fetch --all --tags
+            SHA="$(git rev-parse '${{ inputs.ref || 'main' }}^{commit}')"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Deploying commit: $SHA"
+
+      - name: Preflight (kubectl/kustomize, namespace)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl version --client
+          kustomize version
+          kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
+          kubectl config set-context --current --namespace="$NS"
+          # render-validáció
+          kustomize build k8s/overlays/prod >/dev/null
+          # diff (információs)
+          kubectl diff -k k8s/overlays/prod || true
+
+      - name: Apply overlays
+        run: |
+          set -euo pipefail
+          kubectl apply -k k8s/overlays/prod
+
+      - name: Pin images to CI SHA (deterministic)
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${{ steps.vars.outputs.repo_lower }}"
+          SHA="${{ steps.rev.outputs.sha }}"
+          kubectl -n "$NS" set image deploy/frontend frontend="$REPO-frontend:$SHA"
+          kubectl -n "$NS" set image deploy/backend  backend="$REPO-backend:$SHA"
+
+      - name: Rollout & health (auto-rollback on failure)
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'echo "[!] Rollout failed, rollback..."; \
+                kubectl -n "$NS" rollout undo deploy/backend  || true; \
+                kubectl -n "$NS" rollout undo deploy/frontend || true; \
+                exit 1' ERR
+
+          kubectl -n "$NS" rollout status deploy/backend  --timeout=180s
+          kubectl -n "$NS" rollout status deploy/frontend --timeout=180s
+
+      - name: Smoke test through Ingress
+        shell: bash
+        run: |
+          set -euo pipefail
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+          curl -fsS -H 'Host: demo.local' "http://${NODE_IP}:31080/" >/dev/null
+          curl -fsS -H 'Host: demo.local' "http://${NODE_IP}:31080/api/hello" | tee /tmp/hello.txt
+          grep -qi 'Hello from backend' /tmp/hello.txt
+
+      - name: Summary
+        run: |
+          echo "✅ Deployed commit: ${{ steps.rev.outputs.sha }}"
+          kubectl -n "$NS" get deploy,svc,ingress,pod -o wide
+
+  notify:
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord notify (success)
+        if: ${{ success() }}
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: info
+          details: |
+            🚀 CD succeeded
+            Repo: ${{ github.repository }}
+            Env: prod
+            Commit: ${{ github.sha }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+
+      - name: Discord notify (failure)
+        if: ${{ failure() }}
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: error
+          details: |
+            🔴 CD failed
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
