@@ -2,7 +2,7 @@
 
 Kétkomponensű demo alkalmazás **Kubernetesre**:
 - **frontend** (statikus webapp)
-- **backend** (Spring Boot, Java 21) – `/api/hello` végponttal, ami visszaírja, melyik **pod** szolgálta ki (Downward API env-ekkel)
+- **backend** (Spring Boot, Java 21) – `/api/hello` végponttal, ami válaszol, melyik **pod** szolgálta ki (Downward API env-ekkel)
 
 CI/CD: **GitHub Actions** → build & push a **GHCR**-be → **self-hosted runner** deploy → **Kustomize**.  
 Elérés: **Ingress NGINX** (NodePort), host: `demo.local`.
