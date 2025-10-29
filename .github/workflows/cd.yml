@@ -14,7 +14,8 @@ on:
 
 permissions:
   contents: read
-  packages: read   # GHCR manifest ellenőrzéshez kell
+  actions: read     # szükséges a /actions/workflows/... API-hoz
+  packages: read    # GHCR manifest ellenőrzéshez
 
 concurrency:
   group: deploy-prod
@@ -61,29 +62,29 @@ jobs:
         id: rev
         shell: bash
         env:
-          OWNER: ${{ github.repository_owner }}
-          REPO:  ${{ github.event.repository.name }}
           GITHUB_TOKEN: ${{ github.token }}
           REF_INPUT: ${{ inputs.ref }}
+          # Biztonságos OWNER/REPO feloldás minden eventre:
+          REPO_SLUG: ${{ github.repository }}   # pl. Slaca93/interview-demo
         run: |
           set -euo pipefail
-      
-          need_jq() { command -v jq >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y jq; }; }
-          need_jq
-      
-          # 1) Keressük meg a CI workflow ID-ját (név: "CI" VAGY fájl: "ci.yml")
+
+          OWNER="${REPO_SLUG%%/*}"
+          REPO_NAME="${REPO_SLUG#*/}"
+
+          # 1) Keressük meg a CI workflow ID-ját (név: "CI" VAGY path: */ci.yml)
           WF_JSON=$(curl -fsS \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows?per_page=100")
-      
+            "https://api.github.com/repos/${OWNER}/${REPO_NAME}/actions/workflows?per_page=100")
+
           WF_ID=$(echo "$WF_JSON" | jq -r '
             .workflows
-            | map(select((.name|ascii_downcase)=="ci" or (.path|endswith("/ci.yml"))))
+            | map(select((.name|ascii_downcase)=="ci" or (.path|test("/ci\\.ya?ml$"))))
             | (.[0].id // empty)
           ')
-      
+
           if [ -z "${WF_ID:-}" ]; then
             echo "Nem találtam CI workflow-t név (CI) vagy fájl (ci.yml) alapján."
             echo "Elérhető workflow-k:"
@@ -91,8 +92,8 @@ jobs:
             exit 1
           fi
           echo "CI workflow id: ${WF_ID}"
-      
-          # 2) Ha manuális indításnál adtál ref-et, azt commit SHA-vá oldjuk
+
+          # 2) Manuális indításnál megadott ref -> commit SHA
           if [ -n "${REF_INPUT}" ]; then
             git fetch --all --tags
             SHA="$(git rev-parse "${REF_INPUT}^{commit}")"
@@ -100,21 +101,20 @@ jobs:
             echo "Deploying commit (manual ref): ${SHA}"
             exit 0
           fi
-      
-          # 3) Kérjük le a legutóbbi SIKERES CI futást a main ágon
+
+          # 3) Legutóbbi SIKERES CI futás a main ágon
           RUNS_JSON=$(curl -fsS \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WF_ID}/runs?branch=main&status=success&per_page=1")
-      
+            "https://api.github.com/repos/${OWNER}/${REPO_NAME}/actions/workflows/${WF_ID}/runs?branch=main&status=success&per_page=1")
+
           SHA=$(echo "$RUNS_JSON" | jq -r '.workflow_runs[0].head_sha // empty')
-      
           if [ -z "${SHA:-}" ]; then
             echo "No successful CI run found on main."
             exit 1
           fi
-      
+
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "Deploying commit (latest successful on main): ${SHA}"
 
@@ -143,87 +143,82 @@ jobs:
           if kubectl diff -k k8s/overlays/prod >/dev/null 2>&1; then
             kubectl diff -k k8s/overlays/prod || true
           else
-            # Ha a kubectl diff plugin nincs, csak logolunk
             echo "(info) 'kubectl diff' not available on this runner."
           fi
 
-          - name: Preflight: images exist in GHCR (GitHub API, no Docker)
-            shell: bash
-            env:
-              OWNER: ${{ github.repository_owner }}
-              REPO_NAME: ${{ github.event.repository.name }}
-              SHA:  ${{ steps.rev.outputs.sha }}
-              GITHUB_TOKEN: ${{ github.token }}
-            run: |
-              set -euo pipefail
-          
-              need_jq() {
-                if ! command -v jq >/dev/null 2>&1; then
-                  if command -v apt-get >/dev/null 2>&1; then
-                    sudo apt-get update -y && sudo apt-get install -y jq
-                  else
-                    echo "jq not found and cannot be installed automatically."
-                    exit 1
-                  fi
-                fi
-              }
-          
-              need_jq
-          
-              check_pkg_tag() {
-                local owner="$1" pkg="$2" tag="$3"
-          
-                # Próbáljuk user endpointtal...
-                url_user="https://api.github.com/users/${owner}/packages/container/${pkg}/versions?per_page=100"
-                # ...ha 404, próbáljuk org endpointtal
-                url_org="https://api.github.com/orgs/${owner}/packages/container/${pkg}/versions?per_page=100"
-          
-                # user endpoint
-                code_user=$(curl -fsS -o /tmp/pkgs.json -w "%{http_code}" \
-                  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "${url_user}" || true)
-          
-                if [ "${code_user}" = "200" ]; then
-                  if jq -e --arg TAG "${tag}" '
-                      .[] | .metadata.container.tags? // [] | index($TAG)
-                    ' /tmp/pkgs.json >/dev/null; then
-                    echo "✅ Found tag '${tag}' for package '${pkg}' (user endpoint)."
-                    return 0
-                  fi
-                elif [ "${code_user}" != "404" ]; then
-                  echo "GitHub API error ${code_user} on: ${url_user}"
-                  return 2
-                fi
-          
-                # org endpoint
-                code_org=$(curl -fsS -o /tmp/pkgs.json -w "%{http_code}" \
-                  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "${url_org}" || true)
-          
-                if [ "${code_org}" = "200" ]; then
-                  if jq -e --arg TAG "${tag}" '
-                      .[] | .metadata.container.tags? // [] | index($TAG)
-                    ' /tmp/pkgs.json >/dev/null; then
-                    echo "✅ Found tag '${tag}' for package '${pkg}' (org endpoint)."
-                    return 0
-                  fi
-                elif [ "${code_org}" != "404" ]; then
-                  echo "GitHub API error ${code_org} on: ${url_org}"
-                  return 2
-                fi
-          
-                echo "❌ Tag '${tag}' not found for package '${pkg}'."
-                return 1
-              }
-          
-              # GHCR package nevek: <repo>-backend és <repo>-frontend
-              PKG_BE="${REPO_NAME}-backend"
-              PKG_FE="${REPO_NAME}-frontend"
-          
-              check_pkg_tag "${OWNER}" "${PKG_BE}" "${SHA}" || exit 1
-              check_pkg_tag "${OWNER}" "${PKG_FE}" "${SHA}" || exit 1
+      - name: 'Preflight: images exist in GHCR (GitHub API, no Docker)'
+        id: images
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO_SLUG:    ${{ github.repository }}
+          SHA:          ${{ steps.rev.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          OWNER="${REPO_SLUG%%/*}"
+          REPO_NAME="${REPO_SLUG#*/}"
+
+          need_jq() {
+            command -v jq >/dev/null 2>&1 && return 0
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update -y && sudo apt-get install -y jq
+            else
+              echo "jq not found and cannot be installed automatically."
+              exit 1
+            fi
+          }
+          need_jq
+
+          check_pkg_tag() {
+            local owner="$1" pkg="$2" tag="$3"
+
+            local url_user="https://api.github.com/users/${owner}/packages/container/${pkg}/versions?per_page=100"
+            local url_org="https://api.github.com/orgs/${owner}/packages/container/${pkg}/versions?per_page=100"
+
+            # user endpoint
+            local code_user
+            code_user=$(curl -fsS -o /tmp/pkgs.json -w "%{http_code}" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${url_user}" || true)
+
+            if [ "${code_user}" = "200" ]; then
+              if jq -e --arg TAG "${tag}" '.[] | .metadata.container.tags? // [] | index($TAG)' /tmp/pkgs.json >/dev/null; then
+                echo "✅ Found tag '${tag}' for package '${pkg}' (user endpoint)."
+                return 0
+              fi
+            elif [ "${code_user}" != "404" ]; then
+              echo "GitHub API error ${code_user} on: ${url_user}"
+              return 2
+            fi
+
+            # org endpoint
+            local code_org
+            code_org=$(curl -fsS -o /tmp/pkgs.json -w "%{http_code}" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${url_org}" || true)
+
+            if [ "${code_org}" = "200" ]; then
+              if jq -e --arg TAG "${tag}" '.[] | .metadata.container.tags? // [] | index($TAG)' /tmp/pkgs.json >/dev/null; then
+                echo "✅ Found tag '${tag}' for package '${pkg}' (org endpoint)."
+                return 0
+              fi
+            elif [ "${code_org}" != "404" ]; then
+              echo "GitHub API error ${code_org} on: ${url_org}"
+              return 2
+            fi
+
+            echo "❌ Tag '${tag}' not found for package '${pkg}'."
+            return 1
+          }
+
+          PKG_BE="${REPO_NAME}-backend"
+          PKG_FE="${REPO_NAME}-frontend"
+
+          check_pkg_tag "${OWNER}" "${PKG_BE}" "${SHA}" || exit 1
+          check_pkg_tag "${OWNER}" "${PKG_FE}" "${SHA}" || exit 1
 
       - name: Apply overlays
         shell: bash
