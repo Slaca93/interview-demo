@@ -75,25 +75,61 @@ jobs:
           set -euo pipefail
           kubectl apply -k k8s/overlays/prod
 
-      - name: Pin images to CI SHA (deterministic)
+      # ---- ITT a biztonságos 'pin to SHA' logika ----
+      - name: Pin images to CI SHA safely
+        shell: bash
+        env:
+          REPO_LOWER: ${{ steps.vars.outputs.repo_lower }}
+          SHA: ${{ steps.rev.outputs.sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          REPO="ghcr.io/${{ steps.vars.outputs.repo_lower }}"
-          SHA="${{ steps.rev.outputs.sha }}"
-          kubectl -n "$NS" set image deploy/frontend frontend="$REPO-frontend:$SHA"
-          kubectl -n "$NS" set image deploy/backend  backend="$REPO-backend:$SHA"
+          REPO="ghcr.io/${REPO_LOWER}"
+
+          # helper függvények
+          have_docker() { command -v docker >/dev/null 2>&1; }
+          tag_exists() { docker manifest inspect "$1" >/dev/null 2>&1; }
+          setimg()     { kubectl -n "$NS" set image "$1" "$2=$3"; }
+
+          BACKEND_IMG="${REPO}-backend:${SHA}"
+          FRONTEND_IMG="${REPO}-frontend:${SHA}"
+
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            echo "workflow_run: feltételezzük, hogy a CI pusholta a ${SHA} tageket → pin-elünk SHA-ra."
+            setimg deploy/backend  backend  "${BACKEND_IMG}"
+            setimg deploy/frontend frontend "${FRONTEND_IMG}"
+          else
+            echo "workflow_dispatch: óvatos pin → csak ha docker elérhető és létezik a tag."
+            if have_docker && tag_exists "${BACKEND_IMG}"; then
+              setimg deploy/backend  backend  "${BACKEND_IMG}"
+            else
+              echo "Backend image ${BACKEND_IMG} nem elérhető — marad :latest"
+            fi
+            if have_docker && tag_exists "${FRONTEND_IMG}"; then
+              setimg deploy/frontend frontend "${FRONTEND_IMG}"
+            else
+              echo "Frontend image ${FRONTEND_IMG} nem elérhető — marad :latest"
+            fi
+          fi
 
       - name: Rollout & health (auto-rollback on failure)
         shell: bash
         run: |
           set -euo pipefail
-          trap 'echo "[!] Rollout failed, rollback..."; \
+          trap 'echo "[!] Rollout failed, dumping debug..."; \
+                kubectl -n "$NS" get deploy,rs,pod -o wide || true; \
+                kubectl -n "$NS" describe deploy/backend  || true; \
+                kubectl -n "$NS" describe deploy/frontend || true; \
+                kubectl -n "$NS" logs -l app=backend  --tail=200 || true; \
+                kubectl -n "$NS" logs -l app=frontend --tail=200 || true; \
+                echo "[!] Rolling back..."; \
                 kubectl -n "$NS" rollout undo deploy/backend  || true; \
                 kubectl -n "$NS" rollout undo deploy/frontend || true; \
                 exit 1' ERR
 
-          kubectl -n "$NS" rollout status deploy/backend  --timeout=180s
-          kubectl -n "$NS" rollout status deploy/frontend --timeout=180s
+          # Java warmup miatt nagyobb türelem ajánlott:
+          kubectl -n "$NS" rollout status deploy/backend  --timeout=420s
+          kubectl -n "$NS" rollout status deploy/frontend --timeout=420s
 
       - name: Smoke test through Ingress
         shell: bash
