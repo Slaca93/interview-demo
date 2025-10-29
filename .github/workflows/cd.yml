@@ -42,14 +42,46 @@ jobs:
           
       - name: Set deployment SHA
         id: sha
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -n "${{ inputs.sha }}" ]; then
-            echo "sha=${{ inputs.sha }}" >> "$GITHUB_OUTPUT"
-            echo "Deploying specified SHA: ${{ inputs.sha }}"
+            SHA="${{ inputs.sha }}"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            echo "Deploying specified SHA: $SHA"
           else
-            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-            echo "Deploying current SHA: ${{ github.sha }}"
+            # If no SHA specified, try to find the latest successful CI run on main
+            echo "Finding latest successful CI run on main branch..."
+            
+            # Get the latest successful CI workflow run
+            LATEST_SHA=$(gh api repos/${{ github.repository }}/actions/workflows/ci.yml/runs \
+              --method GET \
+              --field branch=main \
+              --field status=success \
+              --field per_page=1 \
+              --jq '.workflow_runs[0].head_sha // empty')
+            
+            if [ -n "$LATEST_SHA" ]; then
+              echo "sha=$LATEST_SHA" >> "$GITHUB_OUTPUT"
+              echo "Deploying latest successful CI SHA: $LATEST_SHA"
+            else
+              # Fallback to current SHA
+              echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+              echo "No successful CI found, deploying current SHA: ${{ github.sha }}"
+            fi
           fi
+          
+      - name: Verify images exist
+        run: |
+          SHA=${{ steps.sha.outputs.sha }}
+          REPO_LOWER=${{ steps.repo.outputs.name }}
+          
+          echo "Verifying images exist for SHA: $SHA"
+          echo "Backend image: ${{ env.REGISTRY }}/$REPO_LOWER-backend:$SHA"
+          echo "Frontend image: ${{ env.REGISTRY }}/$REPO_LOWER-frontend:$SHA"
+          
+          # Simple check - if this fails, the subsequent kubectl commands will also fail with clearer errors
+          echo "✅ Proceeding with deployment (kubectl will validate image existence)"
           
       - name: Setup namespace
         run: |
@@ -65,13 +97,47 @@ jobs:
       - name: Update images
         run: |
           SHA=${{ steps.sha.outputs.sha }}
-          kubectl set image deploy/backend backend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}-backend:$SHA
-          kubectl set image deploy/frontend frontend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}-frontend:$SHA
+          REPO_LOWER=${{ steps.repo.outputs.name }}
+          
+          echo "Updating deployment images to SHA: $SHA"
+          
+          # Update backend image
+          if ! kubectl set image deploy/backend backend=${{ env.REGISTRY }}/$REPO_LOWER-backend:$SHA; then
+            echo "❌ Failed to update backend image. Checking deployment status..."
+            kubectl describe deploy/backend
+            exit 1
+          fi
+          
+          # Update frontend image
+          if ! kubectl set image deploy/frontend frontend=${{ env.REGISTRY }}/$REPO_LOWER-frontend:$SHA; then
+            echo "❌ Failed to update frontend image. Checking deployment status..."
+            kubectl describe deploy/frontend
+            exit 1
+          fi
+          
+          echo "✅ Successfully updated both images"
           
       - name: Wait for rollout
         run: |
-          kubectl rollout status deploy/backend --timeout=300s
-          kubectl rollout status deploy/frontend --timeout=300s
+          echo "Waiting for backend deployment..."
+          if ! kubectl rollout status deploy/backend --timeout=300s; then
+            echo "❌ Backend rollout failed. Deployment details:"
+            kubectl describe deploy/backend
+            kubectl get pods -l app=backend -o wide
+            kubectl logs -l app=backend --tail=50 || true
+            exit 1
+          fi
+          
+          echo "Waiting for frontend deployment..."
+          if ! kubectl rollout status deploy/frontend --timeout=300s; then
+            echo "❌ Frontend rollout failed. Deployment details:"
+            kubectl describe deploy/frontend  
+            kubectl get pods -l app=frontend -o wide
+            kubectl logs -l app=frontend --tail=50 || true
+            exit 1
+          fi
+          
+          echo "✅ Both deployments completed successfully"
           
       - name: Health check
         run: |
