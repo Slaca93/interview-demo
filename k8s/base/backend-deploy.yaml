@@ -4,6 +4,7 @@ metadata:
   name: backend
   namespace: interview-demo
 spec:
+  revisionHistoryLimit: 0
   replicas: 2
   selector:
     matchLabels:
