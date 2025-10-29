@@ -3,31 +3,53 @@ name: CI
 on:
   push:
     branches: [ "main", "develop", "feature/**" ]
+    paths:
+      - "frontend/**"
+      - "backend/**"
+      - ".github/workflows/ci.yml"
   pull_request:
     branches: [ "main", "develop" ]
+    paths:
+      - "frontend/**"
+      - "backend/**"
+      - ".github/workflows/ci.yml"
 
 permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  detect_changes:
+    runs-on: ubuntu-latest
+    outputs:
+      fe_changed: ${{ steps.ch.outputs.fe }}
+      be_changed: ${{ steps.ch.outputs.be }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: ch
+        with:
+          filters: |
+            fe: 'frontend/**'
+            be: 'backend/**'
+
   frontend:
+    needs: detect_changes
+    if: needs.detect_changes.outputs.fe_changed == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Compute lowercase repo
-        id: vars
+      - uses: actions/checkout@v4
+      - id: vars
         run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Node 20
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-
       - name: FE | Build app
         working-directory: frontend
         run: |
@@ -35,58 +57,79 @@ jobs:
           npm ci
           npm run build --if-present
           echo "::endgroup::"
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: FE | Docker build & push
         run: |
-          echo "::group::Frontend: docker build & push"
           IMAGE="ghcr.io/${{ steps.vars.outputs.repo_lower }}-frontend"
-          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" ./frontend
+          docker build -t "$IMAGE:${{ github.sha }}" ./frontend
           docker push "$IMAGE:${{ github.sha }}"
-          docker push "$IMAGE:latest"
-          echo "::endgroup::"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            docker tag "$IMAGE:${{ github.sha }}" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
 
   backend:
+    needs: detect_changes
+    if: needs.detect_changes.outputs.be_changed == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Compute lowercase repo
-        id: vars
+      - uses: actions/checkout@v4
+      - id: vars
         run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
-
+          cache: maven
       - name: BE | Maven package (skip tests)
         working-directory: backend
         run: |
           echo "::group::Backend: mvn package (skip tests)"
           mvn -B -e -Dmaven.test.skip=true package
           echo "::endgroup::"
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: BE | Docker build & push
         run: |
-          echo "::group::Backend: docker build & push"
           IMAGE="ghcr.io/${{ steps.vars.outputs.repo_lower }}-backend"
-          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" ./backend
+          docker build -t "$IMAGE:${{ github.sha }}" ./backend
           docker push "$IMAGE:${{ github.sha }}"
-          docker push "$IMAGE:latest"
-          echo "::endgroup::"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            docker tag "$IMAGE:${{ github.sha }}" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
+
+
+  notify:
+    needs: [frontend, backend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord notify (success)
+        if: ${{ success() }}
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: info
+          details: |
+            ✅ CI succeeded
+            Repo: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+
+      - name: Discord notify (failure)
+        if: ${{ failure() }}
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: error
+          details: |
+            ❌ CI failed
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
