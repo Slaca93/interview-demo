@@ -18,13 +18,16 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_PREFIX: ${{ github.repository }}
 
 jobs:
   frontend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
+      - name: Set lowercase repo name
+        id: repo
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       
       - uses: dorny/paths-filter@v3
         id: changes
@@ -60,7 +63,7 @@ jobs:
       - name: Build and push Docker image
         if: steps.changes.outputs.fe == 'true'
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-frontend"
+          IMAGE="${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}-frontend"
           docker build -t "$IMAGE:${{ github.sha }}" ./frontend
           docker push "$IMAGE:${{ github.sha }}"
           
@@ -73,6 +76,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
+      - name: Set lowercase repo name
+        id: repo
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       
       - uses: dorny/paths-filter@v3
         id: changes
@@ -106,7 +113,7 @@ jobs:
       - name: Build and push Docker image
         if: steps.changes.outputs.be == 'true'
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-backend"
+          IMAGE="${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}-backend"
           docker build -t "$IMAGE:${{ github.sha }}" ./backend
           docker push "$IMAGE:${{ github.sha }}"
           
