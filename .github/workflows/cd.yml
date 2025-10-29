@@ -1,16 +1,16 @@
-name: Deploy
+name: CD
 
 on:
   workflow_run:
-    workflows: ["CI"]          # a CI workflow neve
+    workflows: ["CI"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref (branch/tag/SHA) to deploy"
+        description: "Git ref (branch/tag/SHA) to deploy (optional). If empty, deploy latest successful CI on main."
         required: false
-        default: "main"
+        default: ""
 
 permissions:
   contents: read
@@ -21,8 +21,8 @@ concurrency:
 
 jobs:
   deploy:
-    # csak sikeres CI után fusson (workflow_run ágon)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # csak sikeres CI után fusson (workflow_run ágon) VAGY manual dispatch
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
     runs-on: [ self-hosted, k8s-deployer ]
     environment:
       name: prod
@@ -34,25 +34,41 @@ jobs:
       - name: Checkout manifests
         uses: actions/checkout@v4
         with:
-          # workflow_run esetén a main HEAD-re váltunk
-          ref: ${{ github.event_name == 'workflow_run' && 'main' || (inputs.ref || 'main') }}
+          # workflow_run: a main HEAD-re váltunk
+          ref: ${{ github.event_name == 'workflow_run' && 'main' || (inputs.ref && inputs.ref || 'main') }}
           fetch-depth: 0
 
       - name: Compute lowercase repo
         id: vars
         run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
+      # --- ÚJ: SHA feloldása ---
       - name: Resolve deploy SHA
         id: rev
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            # legutóbbi SIKERES CI run head_sha-ja
             SHA="${{ github.event.workflow_run.head_sha }}"
           else
-            # dispatch: a megadott ref lehet ág/tag/SHA
-            git fetch --all --tags
-            SHA="$(git rev-parse '${{ inputs.ref || 'main' }}^{commit}')"
+            # workflow_dispatch
+            if [ -n "${{ inputs.ref }}" ]; then
+              # ha kézzel adtak meg ref-et, azt használjuk (commit-ra oldjuk)
+              SHA="$(git rev-parse '${{ inputs.ref }}^{commit}')"
+            else
+              # ha nem adtak ref-et: kérd le a legutóbbi SIKERES CI run-t a main-en (REST API)
+              # 1) Lekérjük az összes completed futást, majd az első success-t kivesszük
+              RUNS_JSON=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/CI.yml/runs?branch=main&status=success&per_page=1")
+              SHA=$(echo "$RUNS_JSON" | jq -r '.workflow_runs[0].head_sha')
+              if [ -z "${SHA:-}" ] || [ "${SHA}" = "null" ]; then
+                echo "No successful CI run found on main."
+                exit 1
+              fi
+            fi
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Deploying commit: $SHA"
@@ -70,66 +86,52 @@ jobs:
           # diff (információs)
           kubectl diff -k k8s/overlays/prod || true
 
+      # --- ÚJ: image-ek létezésének ellenőrzése ---
+      - name: Preflight: images exist in GHCR
+        shell: bash
+        env:
+          REPO: ghcr.io/${{ steps.vars.outputs.repo_lower }}
+          SHA:  ${{ steps.rev.outputs.sha }}
+        run: |
+          set -euo pipefail
+          for comp in backend frontend; do
+            IMAGE="$REPO-$comp:$SHA"
+            if ! docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+              echo "❌ Missing image: $IMAGE"
+              echo "Tip: ellenőrizd, hogy a CI futás valóban feltolta-e a képet erre a SHA-ra."
+              exit 1
+            fi
+            echo "✅ Found image: $IMAGE"
+          done
+
       - name: Apply overlays
         run: |
           set -euo pipefail
           kubectl apply -k k8s/overlays/prod
 
-      # ---- ITT a biztonságos 'pin to SHA' logika ----
-      - name: Pin images to CI SHA safely
+      # --- MÓDOSÍTOTT: pinelés a feloldott SHA-ra ---
+      - name: Pin images to resolved SHA
         shell: bash
         env:
-          REPO_LOWER: ${{ steps.vars.outputs.repo_lower }}
-          SHA: ${{ steps.rev.outputs.sha }}
-          EVENT_NAME: ${{ github.event_name }}
+          REPO: ghcr.io/${{ steps.vars.outputs.repo_lower }}
+          SHA:  ${{ steps.rev.outputs.sha }}
+          NS:   ${{ env.NS }}
         run: |
           set -euo pipefail
-          REPO="ghcr.io/${REPO_LOWER}"
-
-          # helper függvények
-          have_docker() { command -v docker >/dev/null 2>&1; }
-          tag_exists() { docker manifest inspect "$1" >/dev/null 2>&1; }
-          setimg()     { kubectl -n "$NS" set image "$1" "$2=$3"; }
-
-          BACKEND_IMG="${REPO}-backend:${SHA}"
-          FRONTEND_IMG="${REPO}-frontend:${SHA}"
-
-          if [ "$EVENT_NAME" = "workflow_run" ]; then
-            echo "workflow_run: feltételezzük, hogy a CI pusholta a ${SHA} tageket → pin-elünk SHA-ra."
-            setimg deploy/backend  backend  "${BACKEND_IMG}"
-            setimg deploy/frontend frontend "${FRONTEND_IMG}"
-          else
-            echo "workflow_dispatch: óvatos pin → csak ha docker elérhető és létezik a tag."
-            if have_docker && tag_exists "${BACKEND_IMG}"; then
-              setimg deploy/backend  backend  "${BACKEND_IMG}"
-            else
-              echo "Backend image ${BACKEND_IMG} nem elérhető — marad :latest"
-            fi
-            if have_docker && tag_exists "${FRONTEND_IMG}"; then
-              setimg deploy/frontend frontend "${FRONTEND_IMG}"
-            else
-              echo "Frontend image ${FRONTEND_IMG} nem elérhető — marad :latest"
-            fi
-          fi
+          kubectl -n "$NS" set image deploy/backend  backend="$REPO-backend:$SHA"
+          kubectl -n "$NS" set image deploy/frontend frontend="$REPO-frontend:$SHA"
 
       - name: Rollout & health (auto-rollback on failure)
         shell: bash
         run: |
           set -euo pipefail
-          trap 'echo "[!] Rollout failed, dumping debug..."; \
-                kubectl -n "$NS" get deploy,rs,pod -o wide || true; \
-                kubectl -n "$NS" describe deploy/backend  || true; \
-                kubectl -n "$NS" describe deploy/frontend || true; \
-                kubectl -n "$NS" logs -l app=backend  --tail=200 || true; \
-                kubectl -n "$NS" logs -l app=frontend --tail=200 || true; \
-                echo "[!] Rolling back..."; \
+          trap 'echo "[!] Rollout failed, rollback..."; \
                 kubectl -n "$NS" rollout undo deploy/backend  || true; \
                 kubectl -n "$NS" rollout undo deploy/frontend || true; \
                 exit 1' ERR
 
-          # Java warmup miatt nagyobb türelem ajánlott:
-          kubectl -n "$NS" rollout status deploy/backend  --timeout=420s
-          kubectl -n "$NS" rollout status deploy/frontend --timeout=420s
+          kubectl -n "$NS" rollout status deploy/backend  --timeout=180s
+          kubectl -n "$NS" rollout status deploy/frontend --timeout=180s
 
       - name: Smoke test through Ingress
         shell: bash
@@ -143,7 +145,7 @@ jobs:
       - name: Summary
         run: |
           echo "✅ Deployed commit: ${{ steps.rev.outputs.sha }}"
-          kubectl -n "$NS" get deploy,svc,ingress,pod -o wide
+          kubectl -n "$NS" get deploy,rs,svc,ingress,pod -o wide
 
   notify:
     needs: [deploy]
@@ -158,7 +160,7 @@ jobs:
             🚀 CD succeeded
             Repo: ${{ github.repository }}
             Env: prod
-            Commit: ${{ github.sha }}
+            Commit: ${{ needs.deploy.outputs.sha || github.sha }}
             Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
 
