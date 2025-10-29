@@ -2,215 +2,97 @@ name: CD
 
 on:
   workflow_run:
-    workflows: ["CI"]          # A CI workflow neve pontosan "CI" legyen
+    workflows: ["CI"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Git ref (branch/tag/SHA) to deploy (optional). If empty, deploy latest successful CI on main."
+      sha:
+        description: "Commit SHA to deploy (optional, defaults to latest main)"
         required: false
-        default: ""
 
 permissions:
   contents: read
-  packages: read   # GHCR manifest ellenőrzéshez kell
+  packages: read
 
 concurrency:
   group: deploy-prod
   cancel-in-progress: false
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+  NAMESPACE: interview-demo
+
 jobs:
   deploy:
-    # Fusson sikeres CI után (workflow_run), vagy manuális indításra
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
-    runs-on: [ self-hosted, k8s-deployer ]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: [self-hosted, k8s-deployer]
     environment:
       name: prod
       url: http://demo.local:31080
-    env:
-      NS: interview-demo
-    outputs:
-      sha: ${{ steps.rev.outputs.sha }}
-
+    
     steps:
-      - name: Checkout manifests
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          # workflow_run esetén a main HEAD-re váltunk; dispatch-nél a megadott ref vagy main
-          ref: ${{ github.event_name == 'workflow_run' && 'main' || (inputs.ref && inputs.ref || 'main') }}
-          fetch-depth: 0
-
-      - name: Compute lowercase repo
-        id: vars
-        run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-
-      - name: Ensure jq is available
-        shell: bash
+          ref: ${{ inputs.sha || 'main' }}
+          
+      - name: Set deployment SHA
+        id: sha
         run: |
-          if ! command -v jq >/dev/null 2>&1; then
-            if command -v apt-get >/dev/null 2>&1; then
-              sudo apt-get update -y && sudo apt-get install -y jq
-            else
-              echo "jq not found and automatic install not supported on this runner."
-              exit 1
-            fi
-          fi
-
-      - name: Resolve deploy SHA
-        id: rev
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            # A sikeres CI run commitja
-            SHA="${{ github.event.workflow_run.head_sha }}"
+          if [ -n "${{ inputs.sha }}" ]; then
+            echo "sha=${{ inputs.sha }}" >> "$GITHUB_OUTPUT"
+            echo "Deploying specified SHA: ${{ inputs.sha }}"
           else
-            # workflow_dispatch
-            if [ -n "${{ inputs.ref }}" ]; then
-              SHA="$(git rev-parse '${{ inputs.ref }}^{commit}')"
-            else
-              # Legutóbbi sikeres CI futás main ágon
-              RUNS_JSON=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/CI.yml/runs?branch=main&status=success&per_page=1")
-              SHA=$(echo "$RUNS_JSON" | jq -r '.workflow_runs[0].head_sha')
-              if [ -z "${SHA:-}" ] || [ "${SHA}" = "null" ]; then
-                echo "No successful CI run found on main."
-                exit 1
-              fi
-            fi
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            echo "Deploying current SHA: ${{ github.sha }}"
           fi
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Deploying commit: $SHA"
-
-      - name: Login to GHCR (for docker manifest inspect)
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Preflight (kubectl/kustomize, namespace)
-        shell: bash
+          
+      - name: Setup namespace
         run: |
-          set -euo pipefail
-          kubectl version --client
-          if command -v kustomize >/dev/null 2>&1; then
-            kustomize version
-          else
-            echo "kustomize CLI not found; will use 'kubectl kustomize'."
-          fi
-
-          kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
-          kubectl config set-context --current --namespace="$NS"
-
-          # Render validáció
-          if command -v kustomize >/dev/null 2>&1; then
-            kustomize build k8s/overlays/prod >/dev/null
-          else
-            kubectl kustomize k8s/overlays/prod >/dev/null
-          fi
-
-          # Diff (információs)
-          if kubectl diff -k k8s/overlays/prod >/dev/null 2>&1; then
-            kubectl diff -k k8s/overlays/prod || true
-          else
-            # Ha a kubectl diff plugin nincs, csak logolunk
-            echo "(info) 'kubectl diff' not available on this runner."
-          fi
-
-      - name: "Preflight: images exist in GHCR"
-        shell: bash
-        env:
-          REPO: ghcr.io/${{ steps.vars.outputs.repo_lower }}
-          SHA:  ${{ steps.rev.outputs.sha }}
+          kubectl get ns ${{ env.NAMESPACE }} >/dev/null 2>&1 || kubectl create ns ${{ env.NAMESPACE }}
+          kubectl config set-context --current --namespace=${{ env.NAMESPACE }}
+          
+      - name: Validate manifests
+        run: kubectl kustomize k8s/overlays/prod >/dev/null
+        
+      - name: Deploy manifests
+        run: kubectl apply -k k8s/overlays/prod
+        
+      - name: Update images
         run: |
-          set -euo pipefail
-          for comp in backend frontend; do
-            IMAGE="$REPO-$comp:$SHA"
-            if ! docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
-              echo "❌ Missing image: $IMAGE"
-              echo "Tip: ellenőrizd, hogy a CI feltolta-e a képet erre a SHA-ra."
-              exit 1
-            fi
-            echo "✅ Found image: $IMAGE"
-          done
-
-      - name: Apply overlays
-        shell: bash
+          SHA=${{ steps.sha.outputs.sha }}
+          kubectl set image deploy/backend backend=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-backend:$SHA
+          kubectl set image deploy/frontend frontend=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-frontend:$SHA
+          
+      - name: Wait for rollout
         run: |
-          set -euo pipefail
-          if command -v kustomize >/dev/null 2>&1; then
-            kustomize build k8s/overlays/prod | kubectl apply -f -
-          else
-            kubectl kustomize k8s/overlays/prod | kubectl apply -f -
-          fi
-
-      - name: Pin images to resolved SHA
-        shell: bash
-        env:
-          REPO: ghcr.io/${{ steps.vars.outputs.repo_lower }}
-          SHA:  ${{ steps.rev.outputs.sha }}
-          NS:   ${{ env.NS }}
+          kubectl rollout status deploy/backend --timeout=300s
+          kubectl rollout status deploy/frontend --timeout=300s
+          
+      - name: Health check
         run: |
-          set -euo pipefail
-          kubectl -n "$NS" set image deploy/backend  backend="$REPO-backend:$SHA"
-          kubectl -n "$NS" set image deploy/frontend frontend="$REPO-frontend:$SHA"
-
-      - name: Rollout & health (auto-rollback on failure)
-        shell: bash
-        env:
-          NS: ${{ env.NS }}
-        run: |
-          set -euo pipefail
-          trap 'echo "[!] Rollout failed, rollback..."; \
-                kubectl -n "$NS" rollout undo deploy/backend  || true; \
-                kubectl -n "$NS" rollout undo deploy/frontend || true; \
-                exit 1' ERR
-
-          kubectl -n "$NS" rollout status deploy/backend  --timeout=180s
-          kubectl -n "$NS" rollout status deploy/frontend --timeout=180s
-
-      - name: Smoke test through Ingress
-        shell: bash
-        run: |
-          set -euo pipefail
           NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-          curl -fsS -H 'Host: demo.local' "http://${NODE_IP}:31080/" >/dev/null
-          curl -fsS -H 'Host: demo.local' "http://${NODE_IP}:31080/api/hello" | tee /tmp/hello.txt
-          grep -qi 'Hello from backend' /tmp/hello.txt
-
-      - name: Summary
-        shell: bash
+          curl -f -H 'Host: demo.local' "http://${NODE_IP}:31080/"
+          curl -f -H 'Host: demo.local' "http://${NODE_IP}:31080/api/hello" | grep -i "hello from backend"
+          
+      - name: Deployment summary
         run: |
-          echo "✅ Deployed commit: ${{ steps.rev.outputs.sha }}"
-          kubectl -n "$NS" get deploy,rs,svc,ingress,pod -o wide
+          echo "✅ Successfully deployed ${{ steps.sha.outputs.sha }}"
+          kubectl get all -o wide
 
   notify:
+    if: always()
     needs: [deploy]
     runs-on: ubuntu-latest
     steps:
-      - name: Discord notify (success)
-        if: ${{ success() }}
+      - name: Notify Discord
         uses: rjstone/discord-webhook-notify@v1
         with:
-          severity: info
+          severity: ${{ needs.deploy.result == 'success' && 'info' || 'error' }}
           details: |
-            🚀 CD succeeded
+            ${{ needs.deploy.result == 'success' && '🚀 Deployment succeeded' || '🔴 Deployment failed' }}
             Repo: ${{ github.repository }}
-            Env: prod
-            Commit: ${{ needs.deploy.outputs.sha }}
-            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
-
-      - name: Discord notify (failure)
-        if: ${{ failure() }}
-        uses: rjstone/discord-webhook-notify@v1
-        with:
-          severity: error
-          details: |
-            🔴 CD failed
+            Environment: prod
             Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
