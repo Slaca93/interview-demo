@@ -2,27 +2,27 @@ name: CI
 
 on:
   push:
-    branches: [ main, "**" ]        # main + feature ágak
+    branches: [ main, develop, feature/** ]
     paths:
-      - "backend/**"
-      - "frontend/**"
-      - ".github/workflows/ci.yml"
+      - 'backend/**'
+      - 'frontend/**'
+      - '.github/workflows/ci.yml'
   pull_request:
-    branches: [ main ]
+    branches: [ main, develop ]
     paths:
-      - "backend/**"
-      - "frontend/**"
+      - 'backend/**'
+      - 'frontend/**'
 
 permissions:
   contents: read
-  packages: write   # push-hoz kell
+  packages: write
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -37,10 +37,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ---------- BACKEND ----------
-      # main: latest + sha
+      # --- BACKEND ---
       - name: Build & push backend (main)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: ./backend
@@ -51,9 +50,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # feature ág: csak sha
       - name: Build & push backend (non-main)
-        if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+        if: github.ref != 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: ./backend
@@ -62,18 +60,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # PR: build-only (nincs push)
-      - name: Build backend (PR build only)
-        if: github.event_name == 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: ./backend
-          push: false
-          tags: ghcr.io/${{ steps.vars.outputs.repo_lower }}-backend:test
-
-      # ---------- FRONTEND ----------
+      # --- FRONTEND ---
       - name: Build & push frontend (main)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: ./frontend
@@ -85,7 +74,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build & push frontend (non-main)
-        if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+        if: github.ref != 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: ./frontend
@@ -94,10 +83,52 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build frontend (PR build only)
-        if: github.event_name == 'pull_request'
-        uses: docker/build-push-action@v6
+      # --- Notify prep (összefoglaló szöveg) ---
+      - name: Prepare CI summary
+        id: summary
+        shell: bash
+        env:
+          REPO_LC: ${{ steps.vars.outputs.repo_lower }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            be="ghcr.io/${REPO_LC}-backend:latest, ghcr.io/${REPO_LC}-backend:${GITHUB_SHA}"
+            fe="ghcr.io/${REPO_LC}-frontend:latest, ghcr.io/${REPO_LC}-frontend:${GITHUB_SHA}"
+          else
+            be="ghcr.io/${REPO_LC}-backend:${GITHUB_SHA}"
+            fe="ghcr.io/${REPO_LC}-frontend:${GITHUB_SHA}"
+          fi
+          echo "backend_tags=$be" >> "$GITHUB_OUTPUT"
+          echo "frontend_tags=$fe" >> "$GITHUB_OUTPUT"
+
+      # --- Discord notify (success) ---
+      - name: Discord notify (success)
+        if: ${{ success() }}
+        uses: rjstone/discord-webhook-notify@v1
         with:
-          context: ./frontend
-          push: false
-          tags: ghcr.io/${{ steps.vars.outputs.repo_lower }}-frontend:test
+          severity: info
+          details: |
+            ✅ **CI succeeded**
+            Repo: ${{ github.repository }}
+            Ref:  ${{ github.ref }}
+            Commit: ${{ github.sha }}
+            Backend tags:
+              • ${{ steps.summary.outputs.backend_tags }}
+            Frontend tags:
+              • ${{ steps.summary.outputs.frontend_tags }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+
+      # --- Discord notify (failure) ---
+      - name: Discord notify (failure)
+        if: ${{ failure() }}
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: error
+          details: |
+            🔴 **CI failed**
+            Repo: ${{ github.repository }}
+            Ref:  ${{ github.ref }}
+            Commit: ${{ github.sha }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
