@@ -5,11 +5,7 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
-  workflow_dispatch:
-    inputs:
-      sha:
-        description: "Commit SHA to deploy (optional, defaults to latest main)"
-        required: false
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -19,149 +15,78 @@ concurrency:
   group: deploy-prod
   cancel-in-progress: false
 
-env:
-  REGISTRY: ghcr.io
-  NAMESPACE: interview-demo
-
 jobs:
   deploy:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
-    runs-on: [self-hosted, k8s-deployer]
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
+    runs-on: [ self-hosted, k8s-deployer ]
     environment:
       name: prod
       url: http://demo.local:31080
-    
+    env:
+      NS: interview-demo
+
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || 'main' }}
-          
-      - name: Set lowercase repo name
-        id: repo
-        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-          
-      - name: Set deployment SHA
-        id: sha
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ -n "${{ inputs.sha }}" ]; then
-            SHA="${{ inputs.sha }}"
-            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-            echo "Deploying specified SHA: $SHA"
-          else
-            # If no SHA specified, try to find the latest successful CI run on main
-            echo "Finding latest successful CI run on main branch..."
-            
-            # Get the latest successful CI workflow run
-            LATEST_SHA=$(gh api repos/${{ github.repository }}/actions/workflows/ci.yml/runs \
-              --method GET \
-              --field branch=main \
-              --field status=success \
-              --field per_page=1 \
-              --jq '.workflow_runs[0].head_sha // empty')
-            
-            if [ -n "$LATEST_SHA" ]; then
-              echo "sha=$LATEST_SHA" >> "$GITHUB_OUTPUT"
-              echo "Deploying latest successful CI SHA: $LATEST_SHA"
-            else
-              # Fallback to current SHA
-              echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-              echo "No successful CI found, deploying current SHA: ${{ github.sha }}"
-            fi
-          fi
-          
-      - name: Verify images exist
-        run: |
-          SHA=${{ steps.sha.outputs.sha }}
-          REPO_LOWER=${{ steps.repo.outputs.name }}
-          
-          echo "Verifying images exist for SHA: $SHA"
-          echo "Backend image: ${{ env.REGISTRY }}/$REPO_LOWER-backend:$SHA"
-          echo "Frontend image: ${{ env.REGISTRY }}/$REPO_LOWER-frontend:$SHA"
-          
-          # Simple check - if this fails, the subsequent kubectl commands will also fail with clearer errors
-          echo "✅ Proceeding with deployment (kubectl will validate image existence)"
-          
-      - name: Setup namespace
-        run: |
-          kubectl get ns ${{ env.NAMESPACE }} >/dev/null 2>&1 || kubectl create ns ${{ env.NAMESPACE }}
-          kubectl config set-context --current --namespace=${{ env.NAMESPACE }}
-          
-      - name: Validate manifests
-        run: kubectl kustomize k8s/overlays/prod >/dev/null
-        
-      - name: Deploy manifests
-        run: kubectl apply -k k8s/overlays/prod
-        
-      - name: Update images
-        run: |
-          SHA=${{ steps.sha.outputs.sha }}
-          REPO_LOWER=${{ steps.repo.outputs.name }}
-          
-          echo "Updating deployment images to SHA: $SHA"
-          
-          # Update backend image
-          if ! kubectl set image deploy/backend backend=${{ env.REGISTRY }}/$REPO_LOWER-backend:$SHA; then
-            echo "❌ Failed to update backend image. Checking deployment status..."
-            kubectl describe deploy/backend
-            exit 1
-          fi
-          
-          # Update frontend image
-          if ! kubectl set image deploy/frontend frontend=${{ env.REGISTRY }}/$REPO_LOWER-frontend:$SHA; then
-            echo "❌ Failed to update frontend image. Checking deployment status..."
-            kubectl describe deploy/frontend
-            exit 1
-          fi
-          
-          echo "✅ Successfully updated both images"
-          
-      - name: Wait for rollout
-        run: |
-          echo "Waiting for backend deployment..."
-          if ! kubectl rollout status deploy/backend --timeout=300s; then
-            echo "❌ Backend rollout failed. Deployment details:"
-            kubectl describe deploy/backend
-            kubectl get pods -l app=backend -o wide
-            kubectl logs -l app=backend --tail=50 || true
-            exit 1
-          fi
-          
-          echo "Waiting for frontend deployment..."
-          if ! kubectl rollout status deploy/frontend --timeout=300s; then
-            echo "❌ Frontend rollout failed. Deployment details:"
-            kubectl describe deploy/frontend  
-            kubectl get pods -l app=frontend -o wide
-            kubectl logs -l app=frontend --tail=50 || true
-            exit 1
-          fi
-          
-          echo "✅ Both deployments completed successfully"
-          
-      - name: Health check
-        run: |
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-          curl -f -H 'Host: demo.local' "http://${NODE_IP}:31080/"
-          curl -f -H 'Host: demo.local' "http://${NODE_IP}:31080/api/hello" | grep -i "hello from backend"
-          
-      - name: Deployment summary
-        run: |
-          echo "✅ Successfully deployed ${{ steps.sha.outputs.sha }}"
-          kubectl get all -o wide
 
-  notify:
-    if: always()
-    needs: [deploy]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Notify Discord
-        uses: rjstone/discord-webhook-notify@v1
-        with:
-          severity: ${{ needs.deploy.result == 'success' && 'info' || 'error' }}
-          details: |
-            ${{ needs.deploy.result == 'success' && '🚀 Deployment succeeded' || '🔴 Deployment failed' }}
-            Repo: ${{ github.repository }}
-            Environment: prod
-            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+      - name: Preflight (kubectl/kustomize, namespace)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl version --client
+          if command -v kustomize >/dev/null 2>&1; then
+            kustomize version || true
+          else
+            echo "(info) kustomize CLI nincs; 'kubectl kustomize'-t használunk."
+          fi
+          kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
+          kubectl config set-context --current --namespace="$NS"
+          # render check
+          if command -v kustomize >/dev/null 2>&1; then
+            kustomize build k8s/overlays/prod >/dev/null
+          else
+            kubectl kustomize k8s/overlays/prod >/dev/null
+          fi
+
+      - name: Apply overlays
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v kustomize >/dev/null 2>&1; then
+            kustomize build k8s/overlays/prod | kubectl apply -f -
+          else
+            kubectl kustomize k8s/overlays/prod | kubectl apply -f -
+          fi
+
+      - name: Force refresh to pull :latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A manifestben :latest + imagePullPolicy: Always van, így a restart tényleg új image-pullt kényszerít ki
+          kubectl -n "$NS" rollout restart deploy/backend
+          kubectl -n "$NS" rollout restart deploy/frontend
+
+      - name: Rollout & health (auto-rollback on failure)
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'echo "[!] Rollout failed, rollback..."; \
+                kubectl -n "$NS" rollout undo deploy/backend  || true; \
+                kubectl -n "$NS" rollout undo deploy/frontend || true; \
+                exit 1' ERR
+          kubectl -n "$NS" rollout status deploy/backend  --timeout=180s
+          kubectl -n "$NS" rollout status deploy/frontend --timeout=180s
+
+      - name: Smoke test through Ingress
+        shell: bash
+        run: |
+          set -euo pipefail
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+          curl -fsS -H 'Host: demo.local' "http://${NODE_IP}:31080/" >/dev/null
+          curl -fsS -H 'Host: demo.local' "http://${NODE_IP}:31080/api/hello" | tee /tmp/hello.txt
+          grep -qi 'Hello from backend' /tmp/hello.txt
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "✅ Deployed latest images"
+          kubectl -n "$NS" get deploy,rs,svc,ingress,pod -o wide

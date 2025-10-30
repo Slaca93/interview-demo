@@ -16,7 +16,8 @@ spec:
     spec:
       containers:
         - name: backend
-          image: ghcr.io/slaca93/interview-demo-backend:latest
+          image: ghcr.io/slaca93/interview-demo-backend
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
           env:
