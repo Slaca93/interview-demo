@@ -16,6 +16,6 @@ public class Application {
   public String hello() {
     String pod = System.getenv("POD_NAME");
     String ip  = System.getenv("POD_IP");
-    return "Hello from backenddd! pod=" + pod + " ip=" + ip;
+    return "Hello from backend! pod=" + pod + " ip=" + ip;
   }
 }
