@@ -165,17 +165,44 @@ jobs:
           NS: ${{ env.NS }}
         run: |
           set -euo pipefail
+      
+          # Helper: vár, míg az első podnak lesz imageID-je
+          get_imageid_first() {
+            local lbl="$1" tries=30
+            while [ $tries -gt 0 ]; do
+              # első pod első container imageID-je (ha nincs, üres string)
+              id="$(kubectl -n "$NS" get pods -l "app=${lbl}" \
+                    -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null || true)"
+              if [ -n "${id:-}" ]; then
+                echo "$id"
+                return 0
+              fi
+              sleep 2
+              tries=$((tries-1))
+            done
+            echo ""
+            return 1
+          }
+      
           be_img="$(kubectl -n "$NS" get deploy backend  -o jsonpath='{.spec.template.spec.containers[0].image}')"
           fe_img="$(kubectl -n "$NS" get deploy frontend -o jsonpath='{.spec.template.spec.containers[0].image}')"
-          be_dig="$(kubectl -n "$NS" get pods -l app=backend  -o jsonpath='{range .items[*]}{.status.containerStatuses[0].imageID}{"\n"}{end}' | head -n1)"
-          fe_dig="$(kubectl -n "$NS" get pods -l app=frontend -o jsonpath='{range .items[*]}{.status.containerStatuses[0].imageID}{"\n"}{end}' | head -n1)"
-          echo "be_image=$be_img" >> "$GITHUB_OUTPUT"
+      
+          be_dig_full="$(get_imageid_first backend || true)"
+          fe_dig_full="$(get_imageid_first frontend || true)"
+      
+          # imageID formátum: docker-pullable://ghcr.io/...@sha256:XXXX  → csak a digestet tartsuk meg
+          be_dig="${be_dig_full##*@}"
+          fe_dig="${fe_dig_full##*@}"
+      
+          echo "be_image=$be_img"  >> "$GITHUB_OUTPUT"
           echo "be_digest=$be_dig" >> "$GITHUB_OUTPUT"
-          echo "fe_image=$fe_img" >> "$GITHUB_OUTPUT"
+          echo "fe_image=$fe_img"  >> "$GITHUB_OUTPUT"
           echo "fe_digest=$fe_dig" >> "$GITHUB_OUTPUT"
+      
           echo "Deployed:"
-          echo "  backend: $be_img ($be_dig)"
-          echo "  frontend: $fe_img ($fe_dig)"
+          echo "  backend: $be_img (${be_dig:-n/a})"
+          echo "  frontend: $fe_img (${fe_dig:-n/a})"
+      
 
       - name: Summary
         shell: bash
