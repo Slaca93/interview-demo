@@ -7,4 +7,4 @@ spec:
     spec:
       containers:
         - name: backend
-          imagePullPolicy: Always   # mindig húzza le a :latest-et
+          imagePullPolicy: Always
