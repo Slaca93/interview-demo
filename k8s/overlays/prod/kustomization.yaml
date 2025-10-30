@@ -1,12 +1,21 @@
+namespace: interview-demo
 resources:
   - ../../base
 
+# latest tag felülírás kustomize 'images' blokkal
 images:
   - name: ghcr.io/slaca93/interview-demo-backend
     newTag: latest
   - name: ghcr.io/slaca93/interview-demo-frontend
     newTag: latest
 
+# patch-ek célzása explicit targettel (nem dől be akkor sem, ha később namePrefix lenne)
 patches:
   - path: backend-deployment.yaml
+    target:
+      kind: Deployment
+      name: backend
   - path: frontend-deployment.yaml
+    target:
+      kind: Deployment
+      name: frontend
