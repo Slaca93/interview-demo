@@ -5,7 +5,12 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch/tag/SHA) to deploy (optional). If empty, deploy latest successful CI on main."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -24,9 +29,83 @@ jobs:
       url: http://demo.local:31080
     env:
       NS: interview-demo
+    outputs:
+      sha:       ${{ steps.rev.outputs.sha }}
+      be_image:  ${{ steps.capture.outputs.be_image }}
+      be_digest: ${{ steps.capture.outputs.be_digest }}
+      fe_image:  ${{ steps.capture.outputs.fe_image }}
+      fe_digest: ${{ steps.capture.outputs.fe_digest }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout manifests
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && 'main' || (inputs.ref && inputs.ref || 'main') }}
+          fetch-depth: 0
+
+      - name: Compute lowercase repo
+        id: vars
+        run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure jq is available
+        shell: bash
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update -y && sudo apt-get install -y jq
+            else
+              echo "jq not found and automatic install not supported on this runner."
+              exit 1
+            fi
+          fi
+
+      - name: Resolve deploy SHA (find CI workflow ID first)
+        id: rev
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO:  ${{ github.event.repository.name }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REF_INPUT: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          WF_JSON=$(curl -fsS \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows?per_page=100")
+
+          WF_ID=$(echo "$WF_JSON" | jq -r '
+            .workflows
+            | map(select((.name|ascii_downcase)=="ci" or (.path|endswith("/ci.yml"))))
+            | (.[0].id // empty)
+          ')
+          if [ -z "${WF_ID:-}" ]; then
+            echo "Nem találtam CI workflow-t (név: CI vagy path: ci.yml)."
+            echo "$WF_JSON" | jq -r '.workflows[] | "\(.id)  \(.name)  \(.path)"'
+            exit 1
+          fi
+
+          if [ -n "${REF_INPUT}" ]; then
+            git fetch --all --tags
+            SHA="$(git rev-parse "${REF_INPUT}^{commit}")"
+            echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+            echo "Deploying commit (manual ref): ${SHA}"
+            exit 0
+          fi
+
+          RUNS_JSON=$(curl -fsS \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WF_ID}/runs?branch=main&status=success&per_page=1")
+
+          SHA=$(echo "$RUNS_JSON" | jq -r '.workflow_runs[0].head_sha // empty')
+          [ -n "${SHA:-}" ] || { echo "No successful CI run found on main."; exit 1; }
+
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Deploying commit (latest successful on main): ${SHA}"
 
       - name: Preflight (kubectl/kustomize, namespace)
         shell: bash
@@ -40,7 +119,6 @@ jobs:
           fi
           kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
           kubectl config set-context --current --namespace="$NS"
-          # render check
           if command -v kustomize >/dev/null 2>&1; then
             kustomize build k8s/overlays/prod >/dev/null
           else
@@ -57,16 +135,10 @@ jobs:
             kubectl kustomize k8s/overlays/prod | kubectl apply -f -
           fi
 
-      - name: Force refresh to pull :latest
-        shell: bash
-        run: |
-          set -euo pipefail
-          # A manifestben :latest + imagePullPolicy: Always van, így a restart tényleg új image-pullt kényszerít ki
-          kubectl -n "$NS" rollout restart deploy/backend
-          kubectl -n "$NS" rollout restart deploy/frontend
-
       - name: Rollout & health (auto-rollback on failure)
         shell: bash
+        env:
+          NS: ${{ env.NS }}
         run: |
           set -euo pipefail
           trap 'echo "[!] Rollout failed, rollback..."; \
@@ -85,8 +157,61 @@ jobs:
           curl -fsS -H 'Host: demo.local' "http://${NODE_IP}:31080/api/hello" | tee /tmp/hello.txt
           grep -qi 'Hello from backend' /tmp/hello.txt
 
+      # ÚJ: image + digest összegyűjtése a futó podokból
+      - name: Capture deployed image digests
+        id: capture
+        shell: bash
+        env:
+          NS: ${{ env.NS }}
+        run: |
+          set -euo pipefail
+          be_img="$(kubectl -n "$NS" get deploy backend  -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          fe_img="$(kubectl -n "$NS" get deploy frontend -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          be_dig="$(kubectl -n "$NS" get pods -l app=backend  -o jsonpath='{range .items[*]}{.status.containerStatuses[0].imageID}{"\n"}{end}' | head -n1)"
+          fe_dig="$(kubectl -n "$NS" get pods -l app=frontend -o jsonpath='{range .items[*]}{.status.containerStatuses[0].imageID}{"\n"}{end}' | head -n1)"
+          echo "be_image=$be_img" >> "$GITHUB_OUTPUT"
+          echo "be_digest=$be_dig" >> "$GITHUB_OUTPUT"
+          echo "fe_image=$fe_img" >> "$GITHUB_OUTPUT"
+          echo "fe_digest=$fe_dig" >> "$GITHUB_OUTPUT"
+          echo "Deployed:"
+          echo "  backend: $be_img ($be_dig)"
+          echo "  frontend: $fe_img ($fe_dig)"
+
       - name: Summary
         shell: bash
         run: |
-          echo "✅ Deployed latest images"
+          echo "✅ Deployed commit: ${{ steps.rev.outputs.sha }}"
           kubectl -n "$NS" get deploy,rs,svc,ingress,pod -o wide
+
+  notify:
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord notify (success)
+        if: ${{ success() }}
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: info
+          details: |
+            🚀 CD succeeded
+            Repo: ${{ github.repository }}
+            Env: prod
+            Commit: ${{ needs.deploy.outputs.sha }}
+            Backend:
+              image:  ${{ needs.deploy.outputs.be_image }}
+              digest: ${{ needs.deploy.outputs.be_digest }}
+            Frontend:
+              image:  ${{ needs.deploy.outputs.fe_image }}
+              digest: ${{ needs.deploy.outputs.fe_digest }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+
+      - name: Discord notify (failure)
+        if: ${{ failure() }}
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: error
+          details: |
+            🔴 CD failed
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
