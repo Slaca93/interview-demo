@@ -2,31 +2,33 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, "**" ]        # main + feature ágak
     paths:
-      - 'backend/**'
-      - 'frontend/**'
-      - '.github/workflows/ci.yml'
+      - "backend/**"
+      - "frontend/**"
+      - ".github/workflows/ci.yml"
   pull_request:
     branches: [ main ]
     paths:
-      - 'backend/**'
-      - 'frontend/**'
+      - "backend/**"
+      - "frontend/**"
 
 permissions:
   contents: read
-  packages: write
+  packages: write   # push-hoz kell
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    env:
-      REPO_LOWER: ${{ github.repository }}   # pl. slaca93/interview-demo
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+
+      - name: Compute lowercase repo
+        id: vars
+        run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -35,48 +37,67 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- BACKEND ---
-      - name: Build & push backend (main)  # latest + sha
-        if: github.ref == 'refs/heads/main'
+      # ---------- BACKEND ----------
+      # main: latest + sha
+      - name: Build & push backend (main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: ./backend
           push: true
           tags: |
-            ghcr.io/${{ env.REPO_LOWER }}-backend:latest
-            ghcr.io/${{ env.REPO_LOWER }}-backend:${{ github.sha }}
+            ghcr.io/${{ steps.vars.outputs.repo_lower }}-backend:latest
+            ghcr.io/${{ steps.vars.outputs.repo_lower }}-backend:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build & push backend (non-main)  # csak sha
-        if: github.ref != 'refs/heads/main'
+      # feature ág: csak sha
+      - name: Build & push backend (non-main)
+        if: github.event_name == 'push' && github.ref != 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: ./backend
           push: true
-          tags: ghcr.io/${{ env.REPO_LOWER }}-backend:${{ github.sha }}
+          tags: ghcr.io/${{ steps.vars.outputs.repo_lower }}-backend:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # --- FRONTEND ---
-      - name: Build & push frontend (main)  # latest + sha
-        if: github.ref == 'refs/heads/main'
+      # PR: build-only (nincs push)
+      - name: Build backend (PR build only)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          tags: ghcr.io/${{ steps.vars.outputs.repo_lower }}-backend:test
+
+      # ---------- FRONTEND ----------
+      - name: Build & push frontend (main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: ./frontend
           push: true
           tags: |
-            ghcr.io/${{ env.REPO_LOWER }}-frontend:latest
-            ghcr.io/${{ env.REPO_LOWER }}-frontend:${{ github.sha }}
+            ghcr.io/${{ steps.vars.outputs.repo_lower }}-frontend:latest
+            ghcr.io/${{ steps.vars.outputs.repo_lower }}-frontend:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build & push frontend (non-main)  # csak sha
-        if: github.ref != 'refs/heads/main'
+      - name: Build & push frontend (non-main)
+        if: github.event_name == 'push' && github.ref != 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: ./frontend
           push: true
-          tags: ghcr.io/${{ env.REPO_LOWER }}-frontend:${{ github.sha }}
+          tags: ghcr.io/${{ steps.vars.outputs.repo_lower }}-frontend:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build frontend (PR build only)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          tags: ghcr.io/${{ steps.vars.outputs.repo_lower }}-frontend:test
