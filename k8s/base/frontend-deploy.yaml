@@ -16,7 +16,8 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: ghcr.io/slaca93/interview-demo-frontend:latest
+          image: ghcr.io/slaca93/interview-demo-frontend
+          imagePullPolicy: Always
           ports:
             - containerPort: 80
           readinessProbe:
